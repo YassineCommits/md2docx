@@ -371,6 +371,68 @@ function listWordPartsForImagePatch(wordDir) {
   return [...names].map((n) => path.join(wordDir, n)).filter((p) => fs.existsSync(p));
 }
 
+const TABLE_BORDERS = `<w:tblBorders>
+  <w:top w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+  <w:left w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+  <w:bottom w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+  <w:right w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+  <w:insideH w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+  <w:insideV w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+</w:tblBorders>`;
+
+const TABLE_CELL_BORDERS = `<w:tcBorders>
+  <w:top w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+  <w:left w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+  <w:bottom w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+  <w:right w:val="single" w:sz="8" w:space="0" w:color="000000"/>
+</w:tcBorders>`;
+
+function fixIncompleteBorderAttrs(xml) {
+  return xml.replace(
+    /<(w:(?:top|left|bottom|right|insideH|insideV))\b([^>]*)\/>/g,
+    (match, tag, attrs) => {
+      if (attrs.includes("w:sz=")) return match;
+      const val = attrs.match(/w:val="([^"]+)"/)?.[1];
+      if (!val || val === "none" || val === "nil") return match;
+      return `<${tag} w:val="${val}" w:sz="8" w:space="0" w:color="000000"/>`;
+    }
+  );
+}
+
+function addVisibleTableBorders(xml) {
+  if (!xml.includes("<w:tbl")) return xml;
+
+  let next = xml.replace(/<w:tblPr>([\s\S]*?)<\/w:tblPr>/g, (match, inner) => {
+    if (inner.includes("<w:tblBorders")) {
+      return `<w:tblPr>${fixIncompleteBorderAttrs(inner)}</w:tblPr>`;
+    }
+    return `<w:tblPr>${inner}${TABLE_BORDERS}</w:tblPr>`;
+  });
+
+  next = next.replace(/<w:tcPr\s*\/>/g, `<w:tcPr>${TABLE_CELL_BORDERS}</w:tcPr>`);
+  next = next.replace(/<w:tcPr>([\s\S]*?)<\/w:tcPr>/g, (match, inner) => {
+    if (inner.includes("<w:tcBorders")) {
+      return `<w:tcPr>${fixIncompleteBorderAttrs(inner)}</w:tcPr>`;
+    }
+    return `<w:tcPr>${inner}${TABLE_CELL_BORDERS}</w:tcPr>`;
+  });
+
+  return next;
+}
+
+function patchTableStyleBorders(styles) {
+  let next = styles.replace(
+    /(<w:style[^>]*w:styleId="Table"[^>]*>[\s\S]*?<w:tblPr>)([\s\S]*?)(<\/w:tblPr>)/,
+    (match, start, inner, end) => {
+      if (inner.includes("<w:tblBorders")) {
+        return `${start}${fixIncompleteBorderAttrs(inner)}${end}`;
+      }
+      return `${start}${inner}${TABLE_BORDERS}${end}`;
+    }
+  );
+  return fixIncompleteBorderAttrs(next);
+}
+
 function normalizeDocxLayout(outputDocxPath) {
   const unzip = spawnSync("unzip", ["-v"], { stdio: "ignore" });
   if (unzip.error && unzip.error.code === "ENOENT") return;
@@ -391,7 +453,7 @@ function normalizeDocxLayout(outputDocxPath) {
 
     let stylesChanged = false;
     if (fs.existsSync(stylesPath)) {
-      const styles = fs.readFileSync(stylesPath, "utf8");
+      let styles = fs.readFileSync(stylesPath, "utf8");
       const valMatch = styles.match(/<w:lang\b[^>]*\bw:val="([^"]+)"/);
       const langVal = valMatch?.[1];
       if (langVal) {
@@ -400,9 +462,17 @@ function normalizeDocxLayout(outputDocxPath) {
           `$1w:bidi="${langVal}"`
         );
         if (updated !== styles) {
-          fs.writeFileSync(stylesPath, updated, "utf8");
+          styles = updated;
           stylesChanged = true;
         }
+      }
+      const withTableBorders = patchTableStyleBorders(styles);
+      if (withTableBorders !== styles) {
+        styles = withTableBorders;
+        stylesChanged = true;
+      }
+      if (stylesChanged) {
+        fs.writeFileSync(stylesPath, styles, "utf8");
       }
     }
 
@@ -421,16 +491,30 @@ function normalizeDocxLayout(outputDocxPath) {
     });
 
     doc = simplifyPicSpPrForGoogleDocs(doc);
+    doc = addVisibleTableBorders(doc);
     fs.writeFileSync(documentPath, doc, "utf8");
     zipEntries.push("word/document.xml");
 
     for (const partPath of listWordPartsForImagePatch(wordDir)) {
       if (partPath === documentPath) continue;
       let part = fs.readFileSync(partPath, "utf8");
-      if (!part.includes("<pic:spPr")) continue;
-      const next = simplifyPicSpPrForGoogleDocs(part);
-      if (next !== part) {
-        fs.writeFileSync(partPath, next, "utf8");
+      let changed = false;
+      if (part.includes("<pic:spPr")) {
+        const next = simplifyPicSpPrForGoogleDocs(part);
+        if (next !== part) {
+          part = next;
+          changed = true;
+        }
+      }
+      if (part.includes("<w:tbl")) {
+        const next = addVisibleTableBorders(part);
+        if (next !== part) {
+          part = next;
+          changed = true;
+        }
+      }
+      if (changed) {
+        fs.writeFileSync(partPath, part, "utf8");
         zipEntries.push(path.relative(tempDir, partPath).replace(/\\/g, "/"));
       }
     }
